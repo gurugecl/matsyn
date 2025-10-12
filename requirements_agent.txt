@@ -1,5 +1,5 @@
 neo4j==5.14.1
-langchain==0.1.0
+langchain==0.2.5
 langchain-openai==0.0.2
 langchain-community==0.0.10
 openai==1.6.1
