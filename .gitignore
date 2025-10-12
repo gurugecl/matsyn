@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+*.log
+.DS_Store
+venv/
+env/
+.vscode/
+.idea/
+*.swp
+*.swo
+data/
+neo4j_data/
+neo4j_logs/
+neo4j_import/
+neo4j_plugins/
