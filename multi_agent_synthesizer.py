@@ -5,7 +5,8 @@ Uses multiple LLM agents with prioritized knowledge graph retrieval
 
 import os
 import re
-from typing import Dict, List, Tuple
+import json
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from materials_agent import MaterialsSynthesisAgent
 from langchain_openai import ChatOpenAI
@@ -13,6 +14,14 @@ from langchain.schema import HumanMessage, SystemMessage
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# FutureHouse client import
+try:
+    from futurehouse_client import FutureHouseClient, JobNames
+    FUTUREHOUSE_AVAILABLE = True
+except ImportError:
+    FUTUREHOUSE_AVAILABLE = False
+    print("FutureHouse client not installed. Literature search will be disabled.")
 
 
 @dataclass
@@ -95,11 +104,141 @@ Be concise and list only formulas in the priority groups."""
         }
 
 
+class LiteratureSearchAgent:
+    """Agent for searching scientific literature using FutureHouse API"""
+    
+    def __init__(self, futurehouse_api_key: str = None, llm: ChatOpenAI = None):
+        self.api_key = futurehouse_api_key or os.getenv("FUTUREHOUSE_API_KEY")
+        self.llm = llm
+        self.client = None
+        
+        print(f"    DEBUG LiteratureSearchAgent: FUTUREHOUSE_AVAILABLE={FUTUREHOUSE_AVAILABLE}")
+        print(f"    DEBUG LiteratureSearchAgent: api_key={'SET (len=' + str(len(self.api_key)) + ')' if self.api_key else 'NOT SET'}")
+        
+        if FUTUREHOUSE_AVAILABLE and self.api_key:
+            try:
+                print(f"    DEBUG: Creating FutureHouseClient...")
+                self.client = FutureHouseClient(api_key=self.api_key)
+                print(f"    FutureHouse client initialized successfully")
+            except Exception as e:
+                print(f"    FutureHouse initialization failed: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            if not FUTUREHOUSE_AVAILABLE:
+                print(f"    futurehouse-client package not installed")
+            if not self.api_key:
+                print(f"    No FUTUREHOUSE_API_KEY provided")
+    
+    def search_literature(self, formula: str) -> Optional[Dict]:
+        """Search literature for synthesis of a material"""
+        if not self.client:
+            print(f"    FutureHouse client not available for literature search")
+            return None
+        
+        try:
+            print(f"\n  Searching scientific literature for {formula}...")
+            
+            query = f"""Search the academic literature for a detailed synthesis procedure of {formula}.
+            
+Focus on peer-reviewed journals with high-quality synthesis methods. If you find a paper with 
+a detailed synthetic method, extract:
+1. The target material formula
+2. All precursor materials and their formulas
+3. The synthesis type (e.g., solid-state, sol-gel, hydrothermal, etc.)
+4. Step-by-step operations (heating, mixing, calcination, etc.)
+5. Reaction conditions (temperature, time, atmosphere)
+6. The DOI or citation of the paper
+
+Format the response as a structured synthesis procedure."""
+            
+            # Use CROW for fast literature search
+            task_data = {
+                "name": JobNames.CROW,
+                "query": query
+            }
+            
+            print(f"    Querying FutureHouse API...")
+            response = self.client.run_tasks_until_done(task_data)
+            
+            if hasattr(response, 'answer') and response.answer:
+                print(f"    Literature search completed")
+                return self._parse_literature_response(formula, response.answer, response)
+            else:
+                print(f"    No answer from literature search")
+                return None
+                
+        except Exception as e:
+            print(f"    - Literature search error: {e}")
+            return None
+    
+    def _parse_literature_response(self, formula: str, answer: str, response) -> Optional[Dict]:
+        """Parse FutureHouse response and convert to synthesis data format"""
+        try:
+            # Use LLM to structure the response into our format
+            if not self.llm:
+                return None
+            
+            parsing_prompt = f"""Given the following literature search result about synthesizing {formula}, 
+extract and structure the synthesis information into JSON format.
+
+Literature Search Result:
+{answer}
+
+Extract the following information and format as JSON:
+{{
+  "doi": "extracted DOI or 'literature_search'",
+  "paragraph_string": "brief description of the synthesis",
+  "reaction_string": "precursors -> {formula}",
+  "target": {{
+    "material_formula": "{formula}",
+    "material_name": ""
+  }},
+  "precursors": [
+    {{
+      "material_formula": "precursor formula",
+      "material_name": ""
+    }}
+  ],
+  "operations": [
+    {{
+      "type": "operation type (e.g., HeatingOperation, MixingOperation)",
+      "conditions": {{
+        "temperature": {{"values": [temp], "units": "°C"}},
+        "time": {{"values": [time], "units": "h"}},
+        "atmosphere": ["air or other"]
+      }},
+      "string": "brief description"
+    }}
+  ],
+  "type": "synthesis type (e.g., solid-state, sol-gel, hydrothermal)"
+}}
+
+Only output valid JSON. If information is missing, use null or empty arrays."""
+            
+            llm_response = self.llm.invoke([HumanMessage(content=parsing_prompt)])
+            
+            # Extract JSON from response
+            json_match = re.search(r'\{.*\}', llm_response.content, re.DOTALL)
+            if json_match:
+                synthesis_data = json.loads(json_match.group())
+                print(f"    Parsed synthesis data for {formula}")
+                return synthesis_data
+            else:
+                print(f"    Could not parse synthesis data from LLM response")
+                return None
+                
+        except Exception as e:
+            print(f"    Error parsing literature response: {e}")
+            return None
+
+
 class DatabaseQueryAgent:
     """Agent 2: Queries Neo4j knowledge graph"""
     
-    def __init__(self, neo4j_agent: MaterialsSynthesisAgent):
+    def __init__(self, neo4j_agent: MaterialsSynthesisAgent, literature_agent: Optional[LiteratureSearchAgent] = None):
         self.agent = neo4j_agent
+        self.literature_agent = literature_agent
     
     def normalize_formula(self, formula: str) -> str:
         """Convert Unicode subscripts to regular numbers"""
@@ -121,7 +260,7 @@ class DatabaseQueryAgent:
         try:
             # Try exact match first
             routes = self.agent.find_synthesis_routes(normalized_formula, limit=5)
-            print(f"    ✓ Found {len(routes)} exact matches for {formula}")
+            print(f"    Found {len(routes)} exact matches for {formula}")
             
             for route in routes:
                 results.append({
@@ -135,7 +274,7 @@ class DatabaseQueryAgent:
                     'doi': route['doi']
                 })
         except Exception as e:
-            print(f"    ⚠️ Exact match failed for {formula}: {e}")
+            print(f"    Exact match failed for {formula}: {e}")
         
         # If no exact match, try pattern search
         if not results:
@@ -145,18 +284,18 @@ class DatabaseQueryAgent:
                 elements = re.findall(r'([A-Z][a-z]?)', normalized_formula)
                 search_term = normalized_formula[:6] if len(normalized_formula) >= 6 else normalized_formula
                 
-                print(f"    ⚠️ No exact match, trying pattern search with '{search_term}'...")
+                print(f"    No exact match, trying pattern search with '{search_term}'...")
                 
                 # Search for materials containing these elements
                 materials = self.agent.search_materials(search_term, limit=30)  # Use first part of formula
-                print(f"    → Found {len(materials)} candidate materials")
+                print(f"    Found {len(materials)} candidate materials")
                 
                 # Try to find synthesis routes for similar materials
                 for material in materials[:5]:  # Try more materials
                     try:
                         routes = self.agent.find_synthesis_routes(material, limit=2)
                         if routes:
-                            print(f"      ✓ {material}: {len(routes)} route(s)")
+                            print(f"      {material}: {len(routes)} route(s)")
                         for route in routes:
                             results.append({
                                 'material': material,
@@ -172,10 +311,48 @@ class DatabaseQueryAgent:
                         if len(results) >= 3:  # Get at least a few examples
                             break
                     except Exception as e2:
-                        print(f"      ✗ {material}: {e2}")
+                        print(f"      {material}: {e2}")
                         continue
             except Exception as e:
-                print(f"    ✗ Pattern search error: {e}")
+                print(f"    Pattern search error: {e}")
+        
+        # If still no results, try literature search
+        print(f"    DEBUG: results={len(results)}, literature_agent={self.literature_agent is not None}")
+        if not results and self.literature_agent:
+            print(f"    No database results found. Searching scientific literature...")
+            try:
+                lit_data = self.literature_agent.search_literature(normalized_formula)
+                
+                if lit_data:
+                    # Add to database
+                    success = self.agent.add_synthesis_from_literature(lit_data)
+                    
+                    if success:
+                        # Query the newly added synthesis
+                        print(f"    Re-querying database for newly added synthesis...")
+                        routes = self.agent.find_synthesis_routes(normalized_formula, limit=1)
+                        
+                        if routes:
+                            for route in routes:
+                                results.append({
+                                    'material': normalized_formula,
+                                    'reaction_string': route['reaction'],
+                                    'synthesis_type': route['type'],
+                                    'precursors': route['precursors'],
+                                    'operations': route.get('operations', []),
+                                    'paragraph': route.get('paragraph', ''),
+                                    'recipe_id': route.get('recipe_id', ''),
+                                    'doi': route['doi'],
+                                    'from_literature': True
+                                })
+                            print(f"    Added synthesis from literature to database")
+                    else:
+                        print(f"    Could not add literature synthesis to database")
+                else:
+                    print(f"    No synthesis found in literature")
+                    
+            except Exception as e:
+                print(f"    Literature search error: {e}")
         
         return results[:5]  # Limit to 5 procedures per material
     
@@ -191,7 +368,7 @@ class DatabaseQueryAgent:
         exact = self.query_material(target)
         if exact:
             results[0] = exact
-            print(f"    ✓ Found {len(exact)} routes")
+            print(f"    Found {len(exact)} routes")
         
         # Priority 1, 2, 3: Similar materials
         for priority, materials in sorted(priorities.items()):
@@ -204,7 +381,7 @@ class DatabaseQueryAgent:
             
             if priority_results:
                 results[priority] = priority_results
-                print(f"    ✓ Found {len(priority_results)} total routes")
+                print(f"    Found {len(priority_results)} total routes")
         
         return results
 
@@ -320,7 +497,8 @@ RULES:
 class MultiAgentSynthesizer:
     """Orchestrates the multi-agent synthesis recommendation system"""
     
-    def __init__(self, neo4j_agent: MaterialsSynthesisAgent, api_key: str = None, model: str = "gpt-4o-mini"):
+    def __init__(self, neo4j_agent: MaterialsSynthesisAgent, api_key: str = None, model: str = "gpt-4o-mini", 
+                 futurehouse_api_key: str = None):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         
         if not self.api_key:
@@ -333,9 +511,23 @@ class MultiAgentSynthesizer:
             openai_api_key=self.api_key
         )
         
+        # Initialize literature search agent (optional)
+        futurehouse_key = futurehouse_api_key or os.getenv("FUTUREHOUSE_API_KEY")
+        print(f"  DEBUG: FUTUREHOUSE_AVAILABLE={FUTUREHOUSE_AVAILABLE}, futurehouse_key={'SET' if futurehouse_key else 'NOT SET'}")
+        if futurehouse_key and FUTUREHOUSE_AVAILABLE:
+            print("  Initializing FutureHouse literature search...")
+            self.literature_agent = LiteratureSearchAgent(futurehouse_key, self.llm)
+            print(f"  Literature agent initialized: {self.literature_agent.client is not None}")
+        else:
+            if not FUTUREHOUSE_AVAILABLE:
+                print("  FutureHouse client not installed - literature search disabled")
+            elif not futurehouse_key:
+                print("  FutureHouse API key not set - literature search disabled")
+            self.literature_agent = None
+        
         # Initialize agents
         self.analysis_agent = MaterialAnalysisAgent(self.llm)
-        self.query_agent = DatabaseQueryAgent(neo4j_agent)
+        self.query_agent = DatabaseQueryAgent(neo4j_agent, self.literature_agent)
         self.recommendation_agent = SynthesisRecommendationAgent(self.llm)
     
     def synthesize(self, formula: str) -> Dict:
@@ -361,7 +553,7 @@ class MultiAgentSynthesizer:
         )
         
         if not database_results:
-            print("\n  ⚠️ No synthesis procedures found in database")
+            print("\n  No synthesis procedures found in database")
             return {
                 'analysis': analysis,
                 'database_results': {},
@@ -417,13 +609,13 @@ class MultiAgentSynthesizer:
             rec_data = result['recommendations'][priority]
             
             if priority == 0:
-                report += f"### ✅ Based on Exact Match\n\n"
+                report += f"### Based on Exact Match\n\n"
             elif priority == 1:
-                report += f"### 🥇 Priority 1: Most Similar Materials\n\n"
+                report += f"### Priority 1: Most Similar Materials\n\n"
             elif priority == 2:
-                report += f"### 🥈 Priority 2: Similar Materials\n\n"
+                report += f"### Priority 2: Similar Materials\n\n"
             else:
-                report += f"### 🥉 Priority {priority}: Related Materials\n\n"
+                report += f"### Priority {priority}: Related Materials\n\n"
             
             report += rec_data['recommendation'] + "\n\n"
             report += "---\n\n"

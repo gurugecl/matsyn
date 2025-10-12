@@ -125,6 +125,88 @@ class MaterialsSynthesisAgent:
         results = self.execute_query(query, {"pattern": pattern, "limit": limit})
         return [r["formula"] for r in results]
     
+    def add_synthesis_from_literature(self, synthesis_data: Dict) -> bool:
+        """
+        Add a new synthesis procedure from literature to the knowledge graph
+        Expected format matches the JSON structure from the dataset
+        """
+        try:
+            with self.driver.session() as session:
+                # Create or merge target material
+                target = synthesis_data.get('target', {})
+                target_formula = target.get('material_formula', '')
+                
+                if not target_formula:
+                    print(f"    ✗ No target formula provided")
+                    return False
+                
+                # Create recipe
+                recipe_query = """
+                MERGE (recipe:SynthesisRecipe {
+                    recipe_id: $recipe_id,
+                    reaction_string: $reaction_string,
+                    type: $type,
+                    doi: $doi,
+                    paragraph_string: $paragraph
+                })
+                
+                MERGE (target:Material {formula: $target_formula})
+                ON CREATE SET target.name = $target_name
+                
+                MERGE (recipe)-[:PRODUCES]->(target)
+                
+                WITH recipe
+                UNWIND $precursors as prec
+                MERGE (p:Material {formula: prec.material_formula})
+                ON CREATE SET p.name = prec.material_name
+                MERGE (p)-[:PRECURSOR_OF]->(recipe)
+                
+                WITH recipe
+                UNWIND range(0, size($operations)-1) as idx
+                WITH recipe, $operations[idx] as op, idx
+                CREATE (operation:Operation {
+                    type: op.type,
+                    conditions: op.conditions,
+                    string: op.string
+                })
+                CREATE (recipe)-[:HAS_OPERATION {sequence: idx}]->(operation)
+                
+                RETURN recipe.recipe_id as recipe_id
+                """
+                
+                # Prepare data
+                import hashlib
+                import json
+                recipe_id = hashlib.md5(
+                    f"{target_formula}_{synthesis_data.get('doi', '')}".encode()
+                ).hexdigest()[:16]
+                
+                params = {
+                    'recipe_id': recipe_id,
+                    'reaction_string': synthesis_data.get('reaction_string', ''),
+                    'type': synthesis_data.get('type', 'unknown'),
+                    'doi': synthesis_data.get('doi', 'literature_search'),
+                    'paragraph': synthesis_data.get('paragraph_string', ''),
+                    'target_formula': target_formula,
+                    'target_name': target.get('material_name', ''),
+                    'precursors': synthesis_data.get('precursors', []),
+                    'operations': synthesis_data.get('operations', [])
+                }
+                
+                result = session.run(recipe_query, params)
+                record = result.single()
+                
+                if record:
+                    print(f"    ✓ Added synthesis for {target_formula} (ID: {recipe_id})")
+                    return True
+                else:
+                    print(f"    ✗ Failed to add synthesis for {target_formula}")
+                    return False
+                    
+        except Exception as e:
+            print(f"    ✗ Error adding synthesis: {e}")
+            return False
+    
     def get_statistics(self) -> Dict[str, int]:
         """Get database statistics"""
         stats = {}
