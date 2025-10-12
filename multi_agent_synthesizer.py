@@ -631,8 +631,13 @@ def main():
     """Demo the multi-agent system"""
     NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "ai4science")
+    NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    
+    if not NEO4J_PASSWORD:
+        print("ERROR: NEO4J_PASSWORD not set!")
+        print("Please set it in your .env file or: export NEO4J_PASSWORD='your-password'")
+        return
     
     if not OPENAI_API_KEY:
         print("ERROR: OPENAI_API_KEY not set!")
