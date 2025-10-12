@@ -4,6 +4,6 @@ langchain-openai==0.2.8
 langchain-community==0.3.7
 openai==1.54.4
 python-dotenv==1.0.1
-gradio==5.5.0
+gradio==5.31.0
 futurehouse-client>=0.1.0
 
